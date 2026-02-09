@@ -150,8 +150,8 @@ func main() {
 
 	pool := nostr.NewSimplePool(ctx)
 
-	// Publish NIP-89 announcement
-	publishAnnouncement(ctx, pool, sk, pub)
+	// Publish NIP-89 announcement asynchronously (PoW mining can take minutes)
+	go publishAnnouncement(ctx, pool, sk, pub)
 
 	var processed sync.Map
 	freeDir := envOr("STATE_DIR", "/var/lib/dvm-textgen")
@@ -297,7 +297,7 @@ func publishAnnouncement(ctx context.Context, pool *nostr.SimplePool, sk, pub st
 	}
 
 	// Mine NIP-13 proof of work (32 bits required by nos.lol)
-	powCtx, powCancel := context.WithTimeout(ctx, 5*time.Minute)
+	powCtx, powCancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer powCancel()
 	log.Printf("Mining 32-bit PoW for announcement (this may take a moment)...")
 	nonceTag, err := nip13.DoWork(powCtx, ev, 32)
