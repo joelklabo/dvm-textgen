@@ -26,12 +26,12 @@ const (
 	dvmKindTextResult   = 6050
 	dvmKindStatus       = 7000
 	dvmKindAnnouncement = 31990
-	defaultPriceSats    = 21
+	defaultPriceSats    = 10
 	maxPromptLen        = 2000
 	invoicePollInterval = 5 * time.Second
 	invoicePollTimeout  = 10 * time.Minute
 	groqModel           = "llama-3.3-70b-versatile"
-	freeQueriesPerUser  = 1
+	freeQueriesPerUser  = 3
 )
 
 var relays = []string{
@@ -230,8 +230,8 @@ func handleRequest(ctx context.Context, ev *nostr.Event, sk, pub string, cfg Con
 			fmt.Sscanf(tag[1], "%d", &bid)
 			if bid > 0 {
 				priceSats = bid / 1000 // bid is in msats
-				if priceSats < 10 {
-					priceSats = 10
+				if priceSats < 1 {
+					priceSats = 1
 				}
 			}
 		}
@@ -281,7 +281,7 @@ func handleRequest(ctx context.Context, ev *nostr.Event, sk, pub string, cfg Con
 }
 
 func publishAnnouncement(ctx context.Context, pool *nostr.SimplePool, sk, pub string) {
-	content := `{"name":"Maximum Sats AI Text Gen","about":"AI text generation via Llama 3.3 70B. First query FREE, then 21 sats via Lightning. Send kind 5050 with 'i' tag prompt.","picture":"https://maximumsats.com/favicon.ico","nip90Params":{}}`
+	content := `{"name":"Maximum Sats AI Text Gen","about":"AI text generation via Llama 3.3 70B. First 3 queries FREE, then 10 sats via Lightning. Send kind 5050 with 'i' tag prompt.","picture":"https://maximumsats.com/favicon.ico","nip90Params":{}}`
 
 	ev := nostr.Event{
 		Kind:      dvmKindAnnouncement,
