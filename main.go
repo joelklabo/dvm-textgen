@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -29,6 +31,7 @@ const (
 	invoicePollInterval = 5 * time.Second
 	invoicePollTimeout  = 10 * time.Minute
 	groqModel           = "llama-3.3-70b-versatile"
+	freeQueriesPerUser  = 1
 )
 
 var relays = []string{
@@ -43,6 +46,58 @@ type Config struct {
 	LNbitsKey  string
 	LNbitsAuth string // basic auth user:pass
 	GroqAPIKey string
+}
+
+// freeTracker tracks which pubkeys have used their free query.
+// Persists to a file so it survives restarts.
+type freeTracker struct {
+	mu   sync.Mutex
+	used map[string]int
+	path string
+}
+
+func newFreeTracker(dir string) *freeTracker {
+	ft := &freeTracker{
+		used: make(map[string]int),
+		path: filepath.Join(dir, "free-queries.txt"),
+	}
+	ft.load()
+	return ft
+}
+
+func (ft *freeTracker) load() {
+	f, err := os.Open(ft.path)
+	if err != nil {
+		return // file doesn't exist yet
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" {
+			ft.used[line]++
+		}
+	}
+}
+
+func (ft *freeTracker) hasFree(pubkey string) bool {
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	return ft.used[pubkey] < freeQueriesPerUser
+}
+
+func (ft *freeTracker) useFree(pubkey string) {
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	ft.used[pubkey]++
+	// Append to file
+	f, err := os.OpenFile(ft.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("Failed to persist free query: %v", err)
+		return
+	}
+	defer f.Close()
+	fmt.Fprintln(f, pubkey)
 }
 
 func loadConfig() Config {
@@ -98,6 +153,10 @@ func main() {
 	publishAnnouncement(ctx, pool, sk, pub)
 
 	var processed sync.Map
+	freeDir := envOr("STATE_DIR", "/var/lib/dvm-textgen")
+	os.MkdirAll(freeDir, 0755)
+	freeTier := newFreeTracker(freeDir)
+	log.Printf("Free tier: %d queries per user (state: %s)", freeQueriesPerUser, freeTier.path)
 
 	// Subscribe to kind 5050 starting from now (no backfill)
 	since := nostr.Timestamp(time.Now().Add(-60 * time.Second).Unix())
@@ -109,13 +168,13 @@ func main() {
 	log.Printf("Subscribing to kind %d on %v", dvmKindTextGen, relays)
 
 	for ev := range pool.SubMany(ctx, relays, filters) {
-		go handleRequest(ctx, ev.Event, sk, pub, cfg, &processed, pool)
+		go handleRequest(ctx, ev.Event, sk, pub, cfg, &processed, pool, freeTier)
 	}
 
 	log.Println("Subscription ended")
 }
 
-func handleRequest(ctx context.Context, ev *nostr.Event, sk, pub string, cfg Config, processed *sync.Map, pool *nostr.SimplePool) {
+func handleRequest(ctx context.Context, ev *nostr.Event, sk, pub string, cfg Config, processed *sync.Map, pool *nostr.SimplePool, freeTier *freeTracker) {
 	if _, loaded := processed.LoadOrStore(ev.ID, true); loaded {
 		return // Already processed — prevents triple-response bug
 	}
@@ -163,8 +222,10 @@ func handleRequest(ctx context.Context, ev *nostr.Event, sk, pub string, cfg Con
 
 	// Determine price from bid tag
 	priceSats := defaultPriceSats
+	hasBid := false
 	for _, tag := range ev.Tags {
 		if tag[0] == "bid" && len(tag) > 1 {
+			hasBid = true
 			var bid int
 			fmt.Sscanf(tag[1], "%d", &bid)
 			if bid > 0 {
@@ -176,24 +237,35 @@ func handleRequest(ctx context.Context, ev *nostr.Event, sk, pub string, cfg Con
 		}
 	}
 
-	// Create LNbits invoice
-	invoice, paymentHash, err := createInvoice(cfg, priceSats, fmt.Sprintf("DVM Text: %.50s", prompt))
-	if err != nil {
-		log.Printf("Invoice creation failed: %v", err)
-		sendStatus(ctx, pool, sk, pub, ev, "error", "Failed to create Lightning invoice")
-		return
+	// Free tier: first query free for each user (no bid tag = eligible for free)
+	isFreeQuery := false
+	if !hasBid && freeTier.hasFree(ev.PubKey) {
+		isFreeQuery = true
+		log.Printf("FREE TIER: first query for %s", ev.PubKey[:8])
+		freeTier.useFree(ev.PubKey)
+		sendStatus(ctx, pool, sk, pub, ev, "processing", "First query is free! Generating with Llama 3.3 70B...")
+	} else {
+		// Create LNbits invoice
+		invoice, paymentHash, err := createInvoice(cfg, priceSats, fmt.Sprintf("DVM Text: %.50s", prompt))
+		if err != nil {
+			log.Printf("Invoice creation failed: %v", err)
+			sendStatus(ctx, pool, sk, pub, ev, "error", "Failed to create Lightning invoice")
+			return
+		}
+
+		log.Printf("Invoice created: %d sats, hash: %s", priceSats, paymentHash[:8])
+		sendPaymentRequired(ctx, pool, sk, pub, ev, invoice, priceSats)
+
+		paid := pollForPayment(ctx, cfg, paymentHash)
+		if !paid {
+			log.Printf("Payment timeout for %s", ev.ID[:8])
+			return
+		}
+
+		log.Printf("PAID! %d sats for %s", priceSats, ev.ID[:8])
 	}
 
-	log.Printf("Invoice created: %d sats, hash: %s", priceSats, paymentHash[:8])
-	sendPaymentRequired(ctx, pool, sk, pub, ev, invoice, priceSats)
-
-	paid := pollForPayment(ctx, cfg, paymentHash)
-	if !paid {
-		log.Printf("Payment timeout for %s", ev.ID[:8])
-		return
-	}
-
-	log.Printf("PAID! Generating text for %s...", ev.ID[:8])
+	log.Printf("Generating text for %s (free=%v)...", ev.ID[:8], isFreeQuery)
 	sendStatus(ctx, pool, sk, pub, ev, "processing", "Generating response with Llama 3.3 70B...")
 
 	response, err := generateText(cfg, prompt)
@@ -209,7 +281,7 @@ func handleRequest(ctx context.Context, ev *nostr.Event, sk, pub string, cfg Con
 }
 
 func publishAnnouncement(ctx context.Context, pool *nostr.SimplePool, sk, pub string) {
-	content := `{"name":"Maximum Sats AI Text Gen","about":"AI text generation via Llama 3.3 70B. Send kind 5050 with 'i' tag prompt. Pay via Lightning. 21 sats default.","picture":"https://maximumsats.com/favicon.ico","nip90Params":{}}`
+	content := `{"name":"Maximum Sats AI Text Gen","about":"AI text generation via Llama 3.3 70B. First query FREE, then 21 sats via Lightning. Send kind 5050 with 'i' tag prompt.","picture":"https://maximumsats.com/favicon.ico","nip90Params":{}}`
 
 	ev := nostr.Event{
 		Kind:      dvmKindAnnouncement,
