@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/nbd-wtf/go-nostr"
+	"github.com/nbd-wtf/go-nostr/nip13"
 	"github.com/nbd-wtf/go-nostr/nip19"
 )
 
@@ -294,7 +295,20 @@ func publishAnnouncement(ctx context.Context, pool *nostr.SimplePool, sk, pub st
 		},
 		Content: content,
 	}
-	ev.Sign(sk)
+
+	// Mine NIP-13 proof of work (32 bits required by nos.lol)
+	powCtx, powCancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer powCancel()
+	log.Printf("Mining 32-bit PoW for announcement (this may take a moment)...")
+	nonceTag, err := nip13.DoWork(powCtx, ev, 32)
+	if err != nil {
+		log.Printf("PoW mining failed: %v — publishing without PoW", err)
+		ev.Sign(sk)
+	} else {
+		ev.Tags = append(ev.Tags, nonceTag)
+		ev.Sign(sk)
+		log.Printf("PoW mined: difficulty=%d, nonce=%s", nip13.Difficulty(ev.ID), nonceTag[1])
+	}
 
 	for _, url := range relays {
 		relay, err := pool.EnsureRelay(url)
